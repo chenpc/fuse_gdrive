@@ -16,18 +16,60 @@ import oauth2client.client
 
 
 from fuse import FUSE, FuseOSError, Operations
-from gevent.ares import result
 
 credential_path = os.getenv("HOME")+"/.gauth"
 
 class Passthrough(Operations):
-    def __init__(self):
+
+    def path_to_id(self, path):
+        path = self.root + path
+        try:
+            dir_obj = self.path_table[path]
+            if dir_obj:
+                return dir_obj
+        except:
+            self.dblock.acquire()        
+            plist = path.split("/")        
+            dir_obj = self.drive.files().get(fileId='root').execute()
+            
+            for filename in plist:
+                dir_result = []
+                if filename == '':
+                    continue
+                param = {'q' : "'%s' in parents and title = '%s'" % (dir_obj['id'], filename)}
+                files = self.drive.files().list(**param).execute()
+                dir_result.extend(files['items'])
+                if len(dir_result) == 0:
+                    dir_obj = None
+                    break
+                dir_obj = dir_result[0]        
+                
+            self.dblock.release()
+            if dir_obj:
+                self.path_table[path] = dir_obj
+            return dir_obj
+    def create_folder(self, path):
+        basename = os.path.basename(path)
+        dirname = os.path.dirname(path)
+        print "dirname:[", dirname, "] basename:[", basename, "]"
+        dir_folder = self.path_to_id(dirname)
+        base_folder = self.path_to_id(path)
+        if dir_folder and base_folder == None:
+            body = {
+              'title': basename,
+              'description': "disk0-desc",
+              'mimeType': 'application/vnd.google-apps.folder'
+            }
+            body['parents'] = [{'id': dir_folder['id']}]
+            file = self.drive.files().insert(body=body).execute()
+    
+    def __init__(self, root):
         self.fd = 0
         self.fd_table = dict()
         self.path_table = dict()
         self.dir_table = dict()
         self.attr_table = dict()
-        self.root = "/home/chenpc/g2/"
+        self.root = root
         self.dblock = threading.Lock()
         
         # OAuth 2.0 scope that will be authorized.
@@ -59,6 +101,9 @@ class Passthrough(Operations):
         http = httplib2.Http()
         credentials.authorize(http)
         self.drive = apiclient.discovery.build('drive', 'v2', http=http)
+        self.create_folder('/')
+
+
 
     # Helpers
     # =======
@@ -69,38 +114,13 @@ class Passthrough(Operations):
         path = os.path.join(self.root, partial)
         return path
         
-    def path_to_id(self, path):
-        try:
-            dir_obj = self.path_table[path]
-            if dir_obj:
-                return dir_obj
-        except:
-            self.dblock.acquire()        
-            plist = path.split("/")        
-            dir_obj = self.drive.files().get(fileId='root').execute()
-            
-            for filename in plist:
-                dir_result = []
-                if filename == '':
-                    continue
-                param = {'q' : "'%s' in parents and title = '%s'" % (dir_obj['id'], filename)}
-                files = self.drive.files().list(**param).execute()
-                dir_result.extend(files['items'])
-                if len(dir_result) == 0:
-                    dir_obj = None
-                    break
-                dir_obj = dir_result[0]        
-                
-            self.dblock.release()
-            if dir_obj:
-                self.path_table[path] = dir_obj
-            return dir_obj
     
     def get_children(self, path):
-        folder = self.path_to_id(path)  
-        self.dblock.acquire()
+        folder = self.path_to_id(path)
+
         dir_result = []
         param = {'q' : "'%s' in parents" % (folder['id'])}        
+        self.dblock.acquire()
         children = self.drive.files().list(**param).execute()
         self.dblock.release()
         dir_result.extend(children['items'])
@@ -121,38 +141,34 @@ class Passthrough(Operations):
 #     def chown(self, path, uid, gid):
 #         full_path = self._full_path(path)
 #         return os.chown(full_path, uid, gid)
-
-    def getattr(self, path, fh=None):        
-        
-        try:            
-            file_obj = self.attr_table[path]            
+    def getattr(self, path, fh=None):
+        print "getattr", path
+        try:
+            file_obj = self.attr_table[path]
             return file_obj
         except:
-            print "getattr", path
-            print "miss", path
             if path == "/":
                 self.attr_table[path] = dict(st_mode=(S_IFDIR | 0700), st_ctime=time(), st_mtime=time(), st_atime=time(), st_nlink=2)            
                 return  self.attr_table[path]
             else:            
-                file_obj = self.path_to_id(path)            
+                file_obj = self.path_to_id(path)
                 if file_obj:
                     if file_obj['mimeType'] == 'application/vnd.google-apps.folder':
-                        mode = S_IFDIR
-                        size = 4096
-                    else:                    
+                        size = 0
                         mode = S_IFREG
-                        size = int(file_obj['fileSize'])
+                        #size = int(file_obj['fileSize'])
                         
-                    self.attr_table[path] = dict(st_mode=(mode | 0600), st_nlink=1,
+                        self.attr_table[path] = dict(st_mode=(mode | 0600), st_nlink=1,
                                     st_size=size, st_ctime=time(), st_mtime=time(),
-                                    st_atime=time(), st_uid=os.getuid(), st_gid=os.getgid())                
+                                    st_atime=time(), st_uid=os.getuid(), st_gid=os.getgid())
                     return self.attr_table[path]
                 else:
-                    self.attr_table[path] = dict()
+                    #self.attr_table[path] = dict()
                     raise FuseOSError(errno.ENOENT) 
+                    #return self.attr_table[path]
 
     def readdir(self, path, fh):
-#         print "readdir", path
+        print "readdir", path
         try:
             result = self.dir_table[path]
             for file1 in result:                            
@@ -160,7 +176,8 @@ class Passthrough(Operations):
         except:        
             result = self.get_children(path)
             self.dir_table[path] = result
-            for file1 in result:                            
+            for file1 in result:
+                print file1['title']
                 yield file1['title']
  
 
@@ -232,6 +249,7 @@ class Passthrough(Operations):
 #             body=body,
 #             media_body=media_body).execute()
 #         print file
+        self.create_folder(path)
         self.fd += 1
         return self.fd
 
@@ -265,8 +283,8 @@ class Passthrough(Operations):
 #         return self.flush(path, fh)
 
 
-def main(mountpoint):
-    FUSE(Passthrough(), mountpoint, foreground=True)
+def main(mountpoint, root):
+    FUSE(Passthrough(root), mountpoint, foreground=True)
 
 if __name__ == '__main__':
-    main(sys.argv[1])
+    main(sys.argv[2], sys.argv[1])
