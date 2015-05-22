@@ -57,14 +57,39 @@ class Passthrough(Operations):
         if dir_folder and base_folder == None:
             body = {
               'title': basename,
-              'description': "disk0-desc",
-              'mimeType': 'application/vnd.google-apps.folder'
+              'description': "0",
+              'mimeType': 'application/vnd.google-apps.folder',
+              'psize': 0              
             }
             body['parents'] = [{'id': dir_folder['id']}]
-            file = self.drive.files().insert(body=body).execute()
-    
+            self.dblock.acquire()
+            base_folder = self.drive.files().insert(body=body).execute()
+            self.dblock.release()
+        return base_folder
+
+    def create_file(self, path):
+        basename = os.path.basename(path)
+        dirname = os.path.dirname(path)
+        print "dirname:[", dirname, "] basename:[", basename, "]"
+        dir_folder = self.path_to_id(dirname)
+        base_folder = self.path_to_id(path)
+        media_body = apiclient.http.MediaInMemoryUpload(body="")
+        if dir_folder and base_folder == None:
+            body = {
+              'title': basename,
+              'description': "file-desc",
+#               'mimeType': 'application/vnd.google-apps.folder'
+            }
+            body['parents'] = [{'id': dir_folder['id']}]
+            self.dblock.acquire()
+            base_folder = self.drive.files().insert(body=body, media_body=media_body).execute()
+            self.dblock.release()
+            
+        return base_folder
+        
+            
     def __init__(self, root):
-        self.fd = 0
+        self.fd = 5
         self.fd_table = dict()
         self.path_table = dict()
         self.dir_table = dict()
@@ -126,12 +151,20 @@ class Passthrough(Operations):
         dir_result.extend(children['items'])
 #         print "get_children", dir_result
         return dir_result
+    def update_filelength(self, path, length):
+        self.attr_table[path]['size'] = length
+        file = self.path_to_id(path)
+        if file:
+            file['description'] =  str(length)
+            self.dblock.acquire()            
+            self.drive.files().update(body=file, fileId=file['id']).execute()
+            self.dblock.release()
 
     # Filesystem methods
     # ==================
 
-    def access(self, path, mode):
-        full_path = self._full_path(path)
+#     def access(self, path, mode):
+#         full_path = self._full_path(path)
 #         print "access", path, mode
 
 #     def chmod(self, path, mode):
@@ -154,7 +187,7 @@ class Passthrough(Operations):
                 file_obj = self.path_to_id(path)
                 if file_obj:
                     if file_obj['mimeType'] == 'application/vnd.google-apps.folder':
-                        size = 0
+                        size = int(file_obj['description'])
                         mode = S_IFREG
                         #size = int(file_obj['fileSize'])
                         
@@ -176,6 +209,8 @@ class Passthrough(Operations):
         except:        
             result = self.get_children(path)
             self.dir_table[path] = result
+            yield "."
+            yield ".."
             for file1 in result:
                 print file1['title']
                 yield file1['title']
@@ -227,10 +262,16 @@ class Passthrough(Operations):
     def open(self, path, flags):        
         print "open", path
         filename = self.path_to_id(path)
-        
-        self.fd_table[filename['id']] = self.fd
-        self.fd = self.fd + 1
-        return self.fd_table[filename['id']]
+        if filename:
+            try:
+                fd = self.fd_table[path]
+                return fd
+            except:
+                self.fd_table[filename['id']] = self.fd
+                self.fd += 1
+                return self.fd_table[filename['id']]
+        else:
+            return 0
 
     def create(self, path, mode, fi=None):
         print "create[", path,"]"
@@ -249,29 +290,78 @@ class Passthrough(Operations):
 #             body=body,
 #             media_body=media_body).execute()
 #         print file
-        self.create_folder(path)
+        file = self.create_folder(path)
+
+        self.fd_table[file['id']] = self.fd
         self.fd += 1
-        return self.fd
+        return self.fd_table[file['id']]
 
 
     def read(self, path, length, offset, fh):
         print "read", path
-        return 0
+        lba = offset / 4096
+        filename = path+"/"+str(lba).zfill(32)
+        file = self.create_file(filename)
+        self.dblock.acquire()
+        data = self.drive.files().get_media(fileId=file['id']).execute()
+        self.dblock.release()
+        return data
 #         print path
 #         os.lseek(fh, offset, os.SEEK_SET)
 #         return os.read(fh, length)
 # 
     def write(self, path, buf, offset, fh):
-        print "write", path
-        return 0
+        print "write", path, offset, len(buf)
+        lba = offset / 4096
+        filename = path+"/"+str(lba).zfill(32)
+        
+        file = self.create_file(filename)
+        
+        dirname = self.path_to_id(path)
+        length = int(dirname['description'])        
+        
+        if offset+len(buf) > length:
+            dirname['description'] = str(offset+len(buf))
+            try:
+                del self.attr_table[path]
+            except:
+                pass
+            self.dblock.acquire()
+            self.drive.files().update(body=dirname, fileId=dirname['id']).execute()
+            self.dblock.release()
+        
+        media_body = apiclient.http.MediaInMemoryUpload(body=buf)
+        
+        self.dblock.acquire()
+        self.drive.files().update(body=file, fileId=file['id'], media_body=media_body).execute()
+        self.dblock.release()        
+        return len(buf)
 #         print path
 #         os.lseek(fh, offset, os.SEEK_SET)
 #         return os.write(fh, buf)
 # 
-#     def truncate(self, path, length, fh=None):
-#         full_path = self._full_path(path)
-#         with open(full_path, 'r+') as f:
-#             f.truncate(length)
+    def truncate(self, path, length, fh=None):
+        print "truncate", path, length
+        self.update_filelength(path, length)
+        
+        
+    def unlink(self, path):
+        filename = self.path_to_id(path)
+        self.dblock.acquire()
+        print "unlink", path
+        if self.fd_table.has_key(path):
+            del self.fd_table[path]
+        if self.path_table.has_key(path):
+            del self.path_table[path]        
+        if self.dir_table.has_key(path):
+            del self.dir_table[path]
+        if self.attr_table.has_key(path):
+            del self.attr_table[path]
+        
+        self.drive.files().delete(fileId=filename['id']).execute()
+        self.dblock.release()
+        
+        
 # 
 #     def flush(self, path, fh):
 #         return os.fsync(fh)
